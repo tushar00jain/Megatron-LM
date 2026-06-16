@@ -15,7 +15,7 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
-from megatron.core.parallel_state import create_group
+from megatron.core.parallel_state import _use_torchcomms_enabled, create_group
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
     RerunErrorInjector,
@@ -328,8 +328,24 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             store = FakeStore()
             init_process_group_kwargs['backend'] = 'fake'
             init_process_group_kwargs['store'] = store
+        elif _use_torchcomms_enabled() and device_id is not None:
+            # Under torchcomms, hand the parent PG both backends and the
+            # device id; torch.distributed itself does the eager-init
+            # barrier and accepts bare backend names in subgroup calls
+            # (see torch/distributed/distributed_c10d.py:init_process_group).
+            os.environ.setdefault("TORCHCOMM_RANK", str(args.rank))
+            os.environ.setdefault("TORCHCOMM_SIZE", str(args.world_size))
+            init_process_group_kwargs['backend'] = 'cpu:gloo,cuda:nccl'
+            init_process_group_kwargs['device_id'] = device_id
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
+        if _use_torchcomms_enabled() and device_id is not None:
+            # Defensive eager-init flush: device_id alone sets bound_device_id
+            # (which split_group checks) but the underlying NCCL comm is still
+            # created lazily on first collective. A no-op device barrier
+            # forces that creation, sidestepping the intermittent init-time
+            # hang in pytorch/pytorch#153960. One collective at boot.
+            torch.distributed.barrier(device_ids=[device_id.index])
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
     # Set the tensor model-parallel, pipeline model-parallel, and

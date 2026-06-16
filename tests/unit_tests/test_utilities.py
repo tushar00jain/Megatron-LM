@@ -68,11 +68,39 @@ class Utils:
             store = PrefixStore("default_pg", store)
             Utils.store = store
 
-            torch.distributed.init_process_group(
-                backend='nccl', world_size=Utils.world_size, rank=Utils.rank, store=store
-            )
+            # When torch.distributed is routed through TorchComms, hand the
+            # world PG both backends (so subgroups can request gloo) and the
+            # device id; torch.distributed itself does the post-init eager
+            # barrier and accepts bare backend names in subgroup calls.
+            try:
+                from torch.distributed.distributed_c10d import (
+                    _use_torchcomms_enabled,
+                )
 
-            torch.distributed.barrier()
+                _tc_on = _use_torchcomms_enabled()
+            except (ImportError, AttributeError):
+                _tc_on = False
+            local_rank = Utils.rank % torch.cuda.device_count()
+            if _tc_on:
+                os.environ.setdefault('TORCHCOMM_RANK', str(Utils.rank))
+                os.environ.setdefault('TORCHCOMM_SIZE', str(Utils.world_size))
+                torch.distributed.init_process_group(
+                    backend='cpu:gloo,cuda:nccl',
+                    world_size=Utils.world_size,
+                    rank=Utils.rank,
+                    store=store,
+                    device_id=torch.device(f'cuda:{local_rank}'),
+                )
+                # Defensive eager-init flush (see _initialize_distributed).
+                torch.distributed.barrier(device_ids=[local_rank])
+            else:
+                torch.distributed.init_process_group(
+                    backend='nccl',
+                    world_size=Utils.world_size,
+                    rank=Utils.rank,
+                    store=store,
+                )
+                torch.distributed.barrier()
         Utils.inited = True
 
     @staticmethod

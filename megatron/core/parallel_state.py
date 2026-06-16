@@ -25,6 +25,15 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
+try:
+    # Predicate for whether torch.distributed is routed through TorchComms.
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
+
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
@@ -219,6 +228,7 @@ def create_group(
     group_desc=None,
 ):
     """Creates a ProcessGroup."""
+    global _global_process_group_list
     kwargs = {
         "ranks": ranks,
         "timeout": timeout,
@@ -238,7 +248,6 @@ def create_group(
             # type error.
             kwargs.pop("timeout")
     group = torch.distributed.new_group(**kwargs)
-    global _global_process_group_list
     if _global_process_group_list is None:
         # None stands for the default process group
         _global_process_group_list = [None]
