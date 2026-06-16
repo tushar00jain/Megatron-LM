@@ -68,11 +68,42 @@ class Utils:
             store = PrefixStore("default_pg", store)
             Utils.store = store
 
-            torch.distributed.init_process_group(
-                backend='nccl', world_size=Utils.world_size, rank=Utils.rank, store=store
-            )
+            # When torch.distributed is routed through TorchComms, subgroups
+            # are created via split_group, which requires (a) the parent PG to
+            # be eagerly device-bound and (b) the parent to carry every
+            # backend any subgroup might ask for. Megatron requests gloo
+            # subgroups (e.g. dp_gloo) downstream, so init with
+            # cpu:gloo,cuda:nccl and pass device_id when torchcomms is on.
+            try:
+                from torch.distributed.distributed_c10d import (
+                    _use_torchcomms_enabled,
+                )
 
-            torch.distributed.barrier()
+                _tc_on = _use_torchcomms_enabled()
+            except (ImportError, AttributeError):
+                _tc_on = False
+            local_rank = Utils.rank % torch.cuda.device_count()
+            if _tc_on:
+                device_id = torch.device(f'cuda:{local_rank}')
+                os.environ.setdefault('TORCHCOMM_RANK', str(Utils.rank))
+                os.environ.setdefault('TORCHCOMM_SIZE', str(Utils.world_size))
+                torch.distributed.init_process_group(
+                    backend='cpu:gloo,cuda:nccl',
+                    world_size=Utils.world_size,
+                    rank=Utils.rank,
+                    store=store,
+                    device_id=device_id,
+                )
+                # Force eager parent comm creation before any split_group.
+                torch.distributed.barrier(device_ids=[local_rank])
+            else:
+                torch.distributed.init_process_group(
+                    backend='nccl',
+                    world_size=Utils.world_size,
+                    rank=Utils.rank,
+                    store=store,
+                )
+                torch.distributed.barrier()
         Utils.inited = True
 
     @staticmethod

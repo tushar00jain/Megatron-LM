@@ -25,6 +25,135 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
+try:
+    # Predicate for whether torch.distributed is routed through TorchComms.
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
+
+def _nccl_options_to_torchcomms_hints(pg_options) -> dict:
+    """Translate a ``torch.distributed.ProcessGroupNCCL.Options`` instance
+    into the ``Dict[str, str]`` form that TorchComms accepts via
+    ``CommOptions.hints``. Returns ``{}`` if ``pg_options`` is not an NCCL
+    Options object or carries no settings.
+    """
+    hints = {}
+    try:
+        opts = pg_options
+        # `Options.is_high_priority_stream` mirrors the torchcomms hint
+        # ``high_priority_stream``.
+        if getattr(opts, "is_high_priority_stream", False):
+            hints["high_priority_stream"] = "true"
+        cfg = getattr(opts, "config", None)
+        for src, dst in (
+            ("cga_cluster_size", "cga_cluster_size"),
+            ("max_ctas", "max_ctas"),
+            ("min_ctas", "min_ctas"),
+        ):
+            val = getattr(cfg, src, None)
+            # ProcessGroupNCCL's NCCL_CONFIG_UNDEF_INT == -2147483648.
+            if val is not None and val != -(2**31):
+                hints[dst] = str(val)
+    except AttributeError:
+        pass
+    return hints
+
+
+def _build_eager_device_group(ranks, device, hints):
+    """Build a TorchComms ``nccl``-backed device ``ProcessGroup`` over ``ranks``
+    with ``hints`` (e.g. high_priority_stream / cga_cluster_size / max_ctas /
+    min_ctas) applied at comm-construction time.
+
+    Used when the caller passes ``pg_options`` (a ``ProcessGroupNCCL.Options``)
+    that would otherwise be dropped by ``split_group``. Member-rank-only
+    collective bootstrap.
+    """
+    import torch.distributed.distributed_c10d as c10d
+    from torch.distributed import PrefixStore, ProcessGroup
+    from torchcomms import new_comm
+
+    try:
+        from torchcomms._comms import _BackendWrapper
+    except ImportError:
+        from torchcomms._backend_wrapper import _BackendWrapper
+
+    gsize = len(ranks)
+    group_local_rank = ranks.index(torch.distributed.get_rank())
+    tag = "eager_hints_" + "_".join(map(str, ranks)) + "_" + "_".join(f"{k}={v}" for k, v in sorted(hints.items()))
+    store = PrefixStore(f"{tag}/", c10d._get_default_store())
+
+    # high_priority_stream is a dedicated kwarg on new_comm; the rest go
+    # through the free-form hints dict.
+    hp_stream = None
+    if "high_priority_stream" in hints:
+        hp_stream = hints["high_priority_stream"].lower() in ("1", "true", "yes")
+    extra_hints = {k: v for k, v in hints.items() if k != "high_priority_stream"}
+
+    saved = (os.environ.get("TORCHCOMM_RANK"), os.environ.get("TORCHCOMM_SIZE"))
+    os.environ["TORCHCOMM_RANK"] = str(group_local_rank)
+    os.environ["TORCHCOMM_SIZE"] = str(gsize)
+    try:
+        comm = new_comm(
+            "nccl",
+            device,
+            tag,
+            store=PrefixStore("comm/", store),
+            high_priority_stream=hp_stream,
+            hints=extra_hints or None,
+        )
+    finally:
+        for key, value in zip(("TORCHCOMM_RANK", "TORCHCOMM_SIZE"), saved):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    backend_class = _BackendWrapper(comm)
+    pg = ProcessGroup(PrefixStore("pg/", store), group_local_rank, gsize)
+    backend_type = ProcessGroup.BackendType.CUSTOM
+    pg._set_default_backend(backend_type)
+    pg._register_backend(device, backend_type, backend_class)
+    pg._set_group_name(tag)
+    try:
+        pg.bound_device_id = device
+    except Exception:
+        pass
+
+    c10d._register_process_group(tag, pg)
+    c10d._world.pg_map[pg] = ("cuda:nccl", store)
+    c10d._world.pg_names[pg] = tag
+    c10d._world.pg_backend_config[pg] = "cuda:nccl"
+    c10d._world.pg_group_ranks[pg] = {g: i for i, g in enumerate(ranks)}
+    c10d._world.pg_to_tag[pg] = f"user:{tag}"
+    c10d._world.tags_to_pg.setdefault(f"user:{tag}", []).append(pg)
+    return pg
+
+
+def _torchcomms_qualified_backend(backend) -> str:
+    """Normalize a backend to the device-qualified form required by
+    ``split_group``'s backend filter when torch.distributed is routed through
+    TorchComms.
+
+    - ``None`` / ``"nccl"`` → ``"cuda:nccl"``
+    - ``"gloo"`` → ``"cpu:gloo,cuda:nccl"`` (include the parent default device
+      backend; torchcomms requires the child filter to contain it)
+    - Already device-qualified strings pass through unchanged.
+    """
+    if backend is None:
+        return "cuda:nccl"
+    backend_str = str(backend)
+    if ":" in backend_str:
+        return backend_str
+    if backend_str == "gloo":
+        return "cpu:gloo,cuda:nccl"
+    if backend_str == "nccl":
+        return "cuda:nccl"
+    return backend_str
+
+
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
@@ -219,6 +348,26 @@ def create_group(
     group_desc=None,
 ):
     """Creates a ProcessGroup."""
+    global _global_process_group_list
+    if _use_torchcomms_enabled() and backend not in ("mpi", "fake"):
+        if pg_options is not None:
+            hints = _nccl_options_to_torchcomms_hints(pg_options)
+            ranks_list = list(ranks) if ranks is not None else list(
+                range(torch.distributed.get_world_size())
+            )
+            my_rank = torch.distributed.get_rank()
+            if my_rank in ranks_list:
+                device = torch.device(f"cuda:{torch.cuda.current_device()}")
+                pg = _build_eager_device_group(ranks_list, device, hints)
+            else:
+                pg = None
+            if _global_process_group_list is None:
+                _global_process_group_list = [None]
+            if pg is not None:
+                _global_process_group_list.append(pg)
+            return pg
+
+        backend = _torchcomms_qualified_backend(backend)
     kwargs = {
         "ranks": ranks,
         "timeout": timeout,
@@ -238,7 +387,6 @@ def create_group(
             # type error.
             kwargs.pop("timeout")
     group = torch.distributed.new_group(**kwargs)
-    global _global_process_group_list
     if _global_process_group_list is None:
         # None stands for the default process group
         _global_process_group_list = [None]
