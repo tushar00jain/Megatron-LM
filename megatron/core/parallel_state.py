@@ -25,6 +25,305 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
+try:
+    # Predicate for whether torch.distributed is routed through TorchComms.
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
+
+def _seed_torchcomm_master_port(rank: int) -> None:
+    """Agree on a free ``MASTER_PORT`` for the nccl-lazy per-peer comm bootstrap
+    store, broadcast via the world store, so it never collides with the random
+    c10d rendezvous port. No-op if ``MASTER_PORT`` is already set (e.g. by an
+    ``env://`` launcher). Must be called after the world process group is
+    initialized.
+    """
+    import socket
+
+    from torch.distributed.distributed_c10d import _get_default_store
+
+    if os.environ.get("MASTER_PORT"):
+        return
+    store = _get_default_store()
+    key = "megatron_torchcomm_master_port"
+    if rank == 0:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        store.set(key, str(port))
+    else:
+        store.wait([key])
+        port = int(store.get(key).decode())
+    os.environ["MASTER_PORT"] = str(port)
+
+
+def _build_lazy_device_group(ranks, device):
+    """Build a TorchComms ``nccl-lazy``-backed device ``ProcessGroup`` over
+    ``ranks`` (a subset of the world), bypassing ``split_group``.
+
+    Used for the pipeline-parallel group so its point-to-point send/recv get a
+    per-peer 2-rank comm + stream (matching c10d ``ProcessGroupNCCL``), which
+    lets the default PP send/recv loop run over TorchComms without a
+    consolidated-exchange rewrite. ``split_group`` cannot produce a lazy
+    child (it splits the parent's comm), so the comm + ``ProcessGroup`` are
+    constructed manually, mirroring c10d's ``_new_process_group_helper``.
+
+    The comm bootstrap is collective over ``ranks`` only, so the caller MUST
+    invoke this only on ranks that are members of ``ranks``.
+
+    Teardown: the returned PG is destroyed via the normal
+    ``torch.distributed.destroy_process_group`` path. Skipping that destroy
+    and relying on interpreter atexit can SIGSEGV (comm finalize after CUDA
+    teardown).
+    """
+    import torch.distributed.distributed_c10d as c10d
+    from torch.distributed import PrefixStore, ProcessGroup
+    from torchcomms import new_comm
+
+    try:
+        from torchcomms._comms import _BackendWrapper
+    except ImportError:
+        from torchcomms._backend_wrapper import _BackendWrapper
+
+    gsize = len(ranks)
+    group_local_rank = ranks.index(torch.distributed.get_rank())
+    tag = "pp_lazy_" + "_".join(map(str, ranks))
+    store = PrefixStore(f"{tag}/", c10d._get_default_store())
+
+    # TorchComms' bootstrap reads world rank/size from
+    # TORCHCOMM_RANK / TORCHCOMM_SIZE; seed the SUBGROUP-local values just
+    # around new_comm (single-threaded here).
+    saved = (os.environ.get("TORCHCOMM_RANK"), os.environ.get("TORCHCOMM_SIZE"))
+    os.environ["TORCHCOMM_RANK"] = str(group_local_rank)
+    os.environ["TORCHCOMM_SIZE"] = str(gsize)
+    try:
+        comm = new_comm(
+            "nccl-lazy", device, tag, store=PrefixStore("comm/", store)
+        )
+    finally:
+        for key, value in zip(("TORCHCOMM_RANK", "TORCHCOMM_SIZE"), saved):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    backend_class = _BackendWrapper(comm)
+    pg = ProcessGroup(PrefixStore("pg/", store), group_local_rank, gsize)
+    backend_type = ProcessGroup.BackendType.CUSTOM
+    pg._set_default_backend(backend_type)
+    pg._register_backend(device, backend_type, backend_class)
+    pg._set_group_name(tag)
+    try:
+        pg.bound_device_id = device
+    except Exception:
+        pass
+
+    # Register in torch's group bookkeeping so dist.send/recv rank translation
+    # and the world-group-map checks succeed (mirrors _new_process_group_helper).
+    c10d._register_process_group(tag, pg)
+    c10d._world.pg_map[pg] = ("cuda:nccl-lazy", store)
+    c10d._world.pg_names[pg] = tag
+    c10d._world.pg_backend_config[pg] = "cuda:nccl-lazy"
+    c10d._world.pg_group_ranks[pg] = {g: i for i, g in enumerate(ranks)}
+    c10d._world.pg_to_tag[pg] = f"user:{tag}"
+    c10d._world.tags_to_pg.setdefault(f"user:{tag}", []).append(pg)
+    return pg
+
+
+def _nccl_options_to_torchcomms_hints(pg_options) -> dict:
+    """Translate a ``torch.distributed.ProcessGroupNCCL.Options`` instance
+    into the ``Dict[str, str]`` form that TorchComms accepts via
+    ``CommOptions.hints``. Returns ``{}`` if ``pg_options`` is not an NCCL
+    Options object or carries no settings.
+    """
+    hints = {}
+    try:
+        opts = pg_options
+        # `Options.is_high_priority_stream` mirrors the torchcomms hint
+        # ``high_priority_stream``.
+        if getattr(opts, "is_high_priority_stream", False):
+            hints["high_priority_stream"] = "true"
+        cfg = getattr(opts, "config", None)
+        for src, dst in (
+            ("cga_cluster_size", "cga_cluster_size"),
+            ("max_ctas", "max_ctas"),
+            ("min_ctas", "min_ctas"),
+        ):
+            val = getattr(cfg, src, None)
+            # ProcessGroupNCCL's NCCL_CONFIG_UNDEF_INT == -2147483648.
+            if val is not None and val != -(2**31):
+                hints[dst] = str(val)
+    except AttributeError:
+        pass
+    return hints
+
+
+def _build_eager_standalone_group(ranks, device, torchcomms_backend, hints=None):
+    """Build a standalone TorchComms ``ProcessGroup`` over ``ranks`` using
+    ``torchcomms.new_comm`` directly, bypassing ``split_group``. Generalization
+    of ``_build_eager_device_group`` that supports any TorchComms backend (e.g.
+    ``"nccl"`` or ``"gloo"``) — used when the parent PG doesn't have the
+    requested device backend (e.g. an nccl-only parent being asked for a gloo
+    child).
+    """
+    import torch.distributed.distributed_c10d as c10d
+    from torch.distributed import PrefixStore, ProcessGroup
+    from torchcomms import new_comm
+
+    try:
+        from torchcomms._comms import _BackendWrapper
+    except ImportError:
+        from torchcomms._backend_wrapper import _BackendWrapper
+
+    hints = hints or {}
+    gsize = len(ranks)
+    group_local_rank = ranks.index(torch.distributed.get_rank())
+    hint_suffix = "_" + "_".join(f"{k}={v}" for k, v in sorted(hints.items())) if hints else ""
+    tag = f"tc_{torchcomms_backend}_" + "_".join(map(str, ranks)) + hint_suffix
+    store = PrefixStore(f"{tag}/", c10d._get_default_store())
+
+    hp_stream = None
+    if "high_priority_stream" in hints:
+        hp_stream = hints["high_priority_stream"].lower() in ("1", "true", "yes")
+    extra_hints = {k: v for k, v in hints.items() if k != "high_priority_stream"}
+
+    saved = (os.environ.get("TORCHCOMM_RANK"), os.environ.get("TORCHCOMM_SIZE"))
+    os.environ["TORCHCOMM_RANK"] = str(group_local_rank)
+    os.environ["TORCHCOMM_SIZE"] = str(gsize)
+    try:
+        comm = new_comm(
+            torchcomms_backend,
+            device,
+            tag,
+            store=PrefixStore("comm/", store),
+            high_priority_stream=hp_stream,
+            hints=extra_hints or None,
+        )
+    finally:
+        for key, value in zip(("TORCHCOMM_RANK", "TORCHCOMM_SIZE"), saved):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    backend_class = _BackendWrapper(comm)
+    pg = ProcessGroup(PrefixStore("pg/", store), group_local_rank, gsize)
+    backend_type = ProcessGroup.BackendType.CUSTOM
+    pg._set_default_backend(backend_type)
+    pg._register_backend(device, backend_type, backend_class)
+    pg._set_group_name(tag)
+    try:
+        pg.bound_device_id = device
+    except Exception:
+        pass
+
+    backend_cfg = f"{device.type}:{torchcomms_backend}"
+    c10d._register_process_group(tag, pg)
+    c10d._world.pg_map[pg] = (backend_cfg, store)
+    c10d._world.pg_names[pg] = tag
+    c10d._world.pg_backend_config[pg] = backend_cfg
+    c10d._world.pg_group_ranks[pg] = {g: i for i, g in enumerate(ranks)}
+    c10d._world.pg_to_tag[pg] = f"user:{tag}"
+    c10d._world.tags_to_pg.setdefault(f"user:{tag}", []).append(pg)
+    return pg
+
+
+def _build_eager_device_group(ranks, device, hints):
+    """Build a TorchComms ``nccl``-backed device ``ProcessGroup`` over ``ranks``
+    with ``hints`` (e.g. high_priority_stream / cga_cluster_size / max_ctas /
+    min_ctas) applied at comm-construction time.
+
+    Used when the caller passes ``pg_options`` (a ``ProcessGroupNCCL.Options``)
+    that would otherwise be dropped by ``split_group``. Member-rank-only
+    collective bootstrap, like ``_build_lazy_device_group``.
+    """
+    import torch.distributed.distributed_c10d as c10d
+    from torch.distributed import PrefixStore, ProcessGroup
+    from torchcomms import new_comm
+
+    try:
+        from torchcomms._comms import _BackendWrapper
+    except ImportError:
+        from torchcomms._backend_wrapper import _BackendWrapper
+
+    gsize = len(ranks)
+    group_local_rank = ranks.index(torch.distributed.get_rank())
+    tag = "eager_hints_" + "_".join(map(str, ranks)) + "_" + "_".join(f"{k}={v}" for k, v in sorted(hints.items()))
+    store = PrefixStore(f"{tag}/", c10d._get_default_store())
+
+    # high_priority_stream is a dedicated kwarg on new_comm; the rest go
+    # through the free-form hints dict.
+    hp_stream = None
+    if "high_priority_stream" in hints:
+        hp_stream = hints["high_priority_stream"].lower() in ("1", "true", "yes")
+    extra_hints = {k: v for k, v in hints.items() if k != "high_priority_stream"}
+
+    saved = (os.environ.get("TORCHCOMM_RANK"), os.environ.get("TORCHCOMM_SIZE"))
+    os.environ["TORCHCOMM_RANK"] = str(group_local_rank)
+    os.environ["TORCHCOMM_SIZE"] = str(gsize)
+    try:
+        comm = new_comm(
+            "nccl",
+            device,
+            tag,
+            store=PrefixStore("comm/", store),
+            high_priority_stream=hp_stream,
+            hints=extra_hints or None,
+        )
+    finally:
+        for key, value in zip(("TORCHCOMM_RANK", "TORCHCOMM_SIZE"), saved):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    backend_class = _BackendWrapper(comm)
+    pg = ProcessGroup(PrefixStore("pg/", store), group_local_rank, gsize)
+    backend_type = ProcessGroup.BackendType.CUSTOM
+    pg._set_default_backend(backend_type)
+    pg._register_backend(device, backend_type, backend_class)
+    pg._set_group_name(tag)
+    try:
+        pg.bound_device_id = device
+    except Exception:
+        pass
+
+    c10d._register_process_group(tag, pg)
+    c10d._world.pg_map[pg] = ("cuda:nccl", store)
+    c10d._world.pg_names[pg] = tag
+    c10d._world.pg_backend_config[pg] = "cuda:nccl"
+    c10d._world.pg_group_ranks[pg] = {g: i for i, g in enumerate(ranks)}
+    c10d._world.pg_to_tag[pg] = f"user:{tag}"
+    c10d._world.tags_to_pg.setdefault(f"user:{tag}", []).append(pg)
+    return pg
+
+
+def _torchcomms_qualified_backend(backend) -> str:
+    """Normalize a backend to the device-qualified form required by
+    ``split_group``'s backend filter when torch.distributed is routed through
+    TorchComms.
+
+    - ``None`` / ``"nccl"`` → ``"cuda:nccl"``
+    - ``"gloo"`` → ``"cpu:gloo,cuda:nccl"`` (include the parent default device
+      backend; torchcomms requires the child filter to contain it)
+    - Already device-qualified strings pass through unchanged.
+    """
+    if backend is None:
+        return "cuda:nccl"
+    backend_str = str(backend)
+    if ":" in backend_str:
+        return backend_str
+    if backend_str == "gloo":
+        return "cpu:gloo,cuda:nccl"
+    if backend_str == "nccl":
+        return "cuda:nccl"
+    return backend_str
+
+
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
@@ -219,6 +518,46 @@ def create_group(
     group_desc=None,
 ):
     """Creates a ProcessGroup."""
+    global _global_process_group_list
+    if _use_torchcomms_enabled() and backend not in ("mpi", "fake"):
+        # Torchcomms routes new_group through split_group, which requires a
+        # device-qualified backend filter that includes the parent's default
+        # device backend. split_group does not honor pg_options, so when the
+        # caller passes ProcessGroupNCCL.Options (high-priority stream,
+        # cga_cluster_size, max_ctas, min_ctas via get_nccl_options /
+        # --nccl-communicator-config-path) we bypass new_group entirely and
+        # build the comm via torchcomms.new_comm with the hints translated
+        # into CommOptions.hints — preserving the perf knobs that split_group
+        # would otherwise drop.
+        if pg_options is not None:
+            hints = _nccl_options_to_torchcomms_hints(pg_options)
+            ranks_list = list(ranks) if ranks is not None else list(
+                range(torch.distributed.get_world_size())
+            )
+            my_rank = torch.distributed.get_rank()
+            if my_rank in ranks_list:
+                device = torch.device(f"cuda:{torch.cuda.current_device()}")
+                pg = _build_eager_device_group(ranks_list, device, hints)
+            else:
+                pg = None
+            if _global_process_group_list is None:
+                _global_process_group_list = [None]
+            if pg is not None:
+                _global_process_group_list.append(pg)
+            return pg
+
+        # NOTE on PP: sglang originally needed a standalone nccl-lazy comm for
+        # the PP group because in earlier torchcomms builds split_group would
+        # deadlock on PP send/recv between rank-0-excluded subsets (e.g.
+        # [1,3]). In the current build that split_group path works correctly
+        # AND the nccl-lazy path itself introduces a separate bug — the
+        # TorchWorkNCCLQueue garbage-collector mis-indexes lazy work items, so
+        # any collective after PP work SIGSEGVs in
+        # TorchWorkNCCLQueue::garbageCollect. Letting the PP group go through
+        # the same split_group path as every other subgroup fixes both: no
+        # deadlock, no GC corruption. _build_lazy_device_group is kept in the
+        # module for use by older torchcomms builds; gate via env if needed.
+        backend = _torchcomms_qualified_backend(backend)
     kwargs = {
         "ranks": ranks,
         "timeout": timeout,
@@ -238,7 +577,6 @@ def create_group(
             # type error.
             kwargs.pop("timeout")
     group = torch.distributed.new_group(**kwargs)
-    global _global_process_group_list
     if _global_process_group_list is None:
         # None stands for the default process group
         _global_process_group_list = [None]

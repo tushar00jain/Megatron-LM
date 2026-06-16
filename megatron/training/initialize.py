@@ -15,7 +15,11 @@ from megatron.core import mpu, tensor_parallel
 from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_train
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
-from megatron.core.parallel_state import create_group
+from megatron.core.parallel_state import (
+    _torchcomms_qualified_backend,
+    _use_torchcomms_enabled,
+    create_group,
+)
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
     RerunErrorInjector,
@@ -164,6 +168,7 @@ def _compile_dependencies():
         )
 
     torch.distributed.barrier()
+
 
 def _initialize_tp_communicators():
     """initializing the communicators with user buffers for high-performance tensor-model-parallel
@@ -328,8 +333,25 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             store = FakeStore()
             init_process_group_kwargs['backend'] = 'fake'
             init_process_group_kwargs['store'] = store
+        elif _use_torchcomms_enabled() and device_id is not None:
+            # Torchcomms creates subgroups via split_group, which requires the
+            # world PG to be eagerly device-bound and to carry a
+            # device-qualified backend filter.
+            os.environ.setdefault("TORCHCOMM_RANK", str(args.rank))
+            os.environ.setdefault("TORCHCOMM_SIZE", str(args.world_size))
+            init_process_group_kwargs['backend'] = _torchcomms_qualified_backend(
+                args.distributed_backend
+            )
+            init_process_group_kwargs['device_id'] = device_id
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
+        if _use_torchcomms_enabled() and device_id is not None:
+            # Force the parent PG's device comm to be created NOW. TorchComms
+            # split_group requires the parent comm to already be eagerly
+            # initialized; without this barrier, the first subgroup creation
+            # can race with lazy comm init and hang
+            # (cf. pytorch/pytorch#129147, #153960).
+            torch.distributed.barrier(device_ids=[device_id.index])
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
 
     # Set the tensor model-parallel, pipeline model-parallel, and
