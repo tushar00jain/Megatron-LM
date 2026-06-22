@@ -25,6 +25,75 @@ try:
 except ImportError:
     HAVE_EINOPS = False
 
+try:
+    # Predicate for whether torch.distributed is routed through TorchComms.
+    from torch.distributed.distributed_c10d import _use_torchcomms_enabled
+except (ImportError, AttributeError):
+
+    def _use_torchcomms_enabled() -> bool:
+        return False
+
+
+def _build_lazy_device_group(ranks, device, tag):
+    """Build a TorchComms ``nccl-lazy``-backed device ProcessGroup over *ranks*.
+
+    ``nccl-lazy`` creates per-peer NCCL communicators for P2P send/recv
+    (matching c10d ProcessGroupNCCL behaviour), which allows concurrent
+    send/recv to different peers to overlap — something a single eager
+    TorchComm cannot do.  ``split_group`` always produces an eager child,
+    so we construct the comm + ProcessGroup manually.
+
+    The comm bootstrap is collective over *ranks* only — the caller MUST
+    invoke this only on ranks that are members.
+    """
+    import torch.distributed.distributed_c10d as c10d
+    from torch.distributed import PrefixStore, ProcessGroup
+    from torchcomms import new_comm
+
+    try:
+        from torchcomms._comms import _BackendWrapper
+    except Exception:
+        from torchcomms._backend_wrapper import _BackendWrapper
+
+    gsize = len(ranks)
+    group_local_rank = ranks.index(torch.distributed.get_rank())
+    store = PrefixStore(f"{tag}/", c10d._get_default_store())
+
+    saved = (os.environ.get("TORCHCOMM_RANK"), os.environ.get("TORCHCOMM_SIZE"))
+    os.environ["TORCHCOMM_RANK"] = str(group_local_rank)
+    os.environ["TORCHCOMM_SIZE"] = str(gsize)
+    try:
+        comm = new_comm(
+            "nccl-lazy", device, store=PrefixStore("comm/", store), name=tag
+        )
+    finally:
+        for key, value in zip(("TORCHCOMM_RANK", "TORCHCOMM_SIZE"), saved):
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    backend_class = _BackendWrapper(comm)
+    pg = ProcessGroup(PrefixStore("pg/", store), group_local_rank, gsize)
+    backend_type = ProcessGroup.BackendType.CUSTOM
+    pg._set_default_backend(backend_type)
+    pg._register_backend(device, backend_type, backend_class)
+    pg._set_group_name(tag)
+    try:
+        pg.bound_device_id = device
+    except Exception:
+        pass
+
+    c10d._register_process_group(tag, pg)
+    c10d._world.pg_map[pg] = ("cuda:nccl-lazy", store)
+    c10d._world.pg_names[pg] = tag
+    c10d._world.pg_backend_config[pg] = "cuda:nccl-lazy"
+    c10d._world.pg_group_ranks[pg] = {g: i for i, g in enumerate(ranks)}
+    c10d._world.pg_to_tag[pg] = f"user:{tag}"
+    c10d._world.tags_to_pg.setdefault(f"user:{tag}", []).append(pg)
+    return pg
+
+
 # Intra-layer model parallel group that the current rank belongs to.
 _TENSOR_MODEL_PARALLEL_GROUP = None
 # Inter-layer model parallel group that the current rank belongs to.
@@ -219,6 +288,7 @@ def create_group(
     group_desc=None,
 ):
     """Creates a ProcessGroup."""
+    global _global_process_group_list
     kwargs = {
         "ranks": ranks,
         "timeout": timeout,
@@ -238,7 +308,6 @@ def create_group(
             # type error.
             kwargs.pop("timeout")
     group = torch.distributed.new_group(**kwargs)
-    global _global_process_group_list
     if _global_process_group_list is None:
         # None stands for the default process group
         _global_process_group_list = [None]
@@ -1013,6 +1082,7 @@ def initialize_model_parallel(
 
     # Build the pipeline model-parallel groups and embedding groups
     # (first and last rank in each pipeline model-parallel group).
+    global _global_process_group_list
     global _PIPELINE_MODEL_PARALLEL_GROUP
     global _PIPELINE_GLOBAL_RANKS
     assert (
@@ -1077,17 +1147,36 @@ def initialize_model_parallel(
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
     for ranks in decoder_rank_generator.get_ranks('pp'):
-        group = create_group(
-            ranks,
-            timeout=timeout,
-            backend=pipeline_model_parallel_comm_backend,
-            pg_options=(
-                None
-                if pipeline_model_parallel_comm_backend == "ucc"
-                else get_nccl_options("pp", nccl_comm_cfgs)
-            ),
-            group_desc="PIPELINE_MODEL_PARALLEL_GROUP",
-        )
+        if (
+            _use_torchcomms_enabled()
+            and pipeline_model_parallel_comm_backend != "ucc"
+        ):
+            # nccl-lazy: per-peer comms for P2P overlap (like ProcessGroupNCCL).
+            # Collective only among members — non-members skip entirely.
+            if rank in ranks:
+                local_rank = int(
+                    os.environ.get("LOCAL_RANK", rank % torch.cuda.device_count())
+                )
+                device = torch.device(f"cuda:{local_rank}")
+                tag = "pp_lazy_" + "_".join(map(str, ranks))
+                group = _build_lazy_device_group(ranks, device, tag)
+                if _global_process_group_list is None:
+                    _global_process_group_list = [None]
+                _global_process_group_list.append(group)
+            else:
+                group = None
+        else:
+            group = create_group(
+                ranks,
+                timeout=timeout,
+                backend=pipeline_model_parallel_comm_backend,
+                pg_options=(
+                    None
+                    if pipeline_model_parallel_comm_backend == "ucc"
+                    else get_nccl_options("pp", nccl_comm_cfgs)
+                ),
+                group_desc="PIPELINE_MODEL_PARALLEL_GROUP",
+            )
         assert (
             pipeline_model_parallel_comm_backend == None
             or pipeline_model_parallel_comm_backend == "nccl"
