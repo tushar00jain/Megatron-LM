@@ -33,12 +33,36 @@ def clear_nvte_env_vars():
     os.environ.pop('NVTE_UNFUSED_ATTN', None)
 
 
+def create_embedding_groups(grid, view=None):
+    """Build the embedding / position-embedding groups of a ``HyperCommGrid``.
+
+    Returns this rank's ``(embd_group, pos_embd_group)`` (``None`` for a family
+    this rank is not part of).
+
+    Both families are built from the grid's *full* PP partition with a single
+    ``torch.distributed.split_group`` collective each, mirroring
+    ``megatron.core.parallel_state``. Creating them with one ``new_group`` per PP
+    group instead would send non-member ranks down ``new_group``'s eager
+    no-color-split path (``performNocolorSplit``), which not every cuda backend
+    implements.
+    """
+    pp_enum = grid.get_rank_enum("pp", view=view)
+    embd_group = ps.create_split_groups(
+        [ps.default_embedding_ranks(pp_ranks) for pp_ranks in pp_enum],
+        group_desc="EMBEDDING_GROUP",
+    )
+    pos_embd_group = ps.create_split_groups(
+        [ps.default_position_embedding_ranks(pp_ranks) for pp_ranks in pp_enum],
+        group_desc="POSITION_EMBEDDING_GROUP",
+    )
+    return embd_group, pos_embd_group
+
+
 class Utils:
 
     world_size = int(os.environ.get('WORLD_SIZE', '1'))
     rank = int(os.environ.get('LOCAL_RANK', '0'))
     inited = False
-    store = None
 
     @staticmethod
     def initialize_distributed():
@@ -66,10 +90,17 @@ class Utils:
             # Use a PrefixStore to avoid accidental overrides of keys used by
             # different systems (e.g. RPC) in case the store is multi-tenant.
             store = PrefixStore("default_pg", store)
-            Utils.store = store
 
+            local_rank = Utils.rank % torch.cuda.device_count()
+            # Give the world PG a cpu:gloo backend alongside the cuda backend so
+            # gloo subgroups can be built with split_group (mirrors
+            # _initialize_distributed).
             torch.distributed.init_process_group(
-                backend='nccl', world_size=Utils.world_size, rank=Utils.rank, store=store
+                backend='cpu:gloo,cuda:nccl',
+                world_size=Utils.world_size,
+                rank=Utils.rank,
+                store=store,
+                device_id=torch.device(f'cuda:{local_rank}'),
             )
 
             torch.distributed.barrier()
