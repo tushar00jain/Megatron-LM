@@ -328,6 +328,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             store = FakeStore()
             init_process_group_kwargs['backend'] = 'fake'
             init_process_group_kwargs['store'] = store
+        elif device_id is not None:
+            # Bind the world PG (nccl2) to this rank's cuda device.
+            init_process_group_kwargs['device_id'] = device_id
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)
