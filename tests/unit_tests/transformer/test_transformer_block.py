@@ -565,7 +565,15 @@ class TestMixedProcessGroups:
             self.local_attn_config = copy.deepcopy(self.config)
             self.local_pgs = ProcessGroupCollection.use_mpu_process_groups()
             self.local_attn_config.context_parallel_size = 1
-            self.local_pgs.cp = torch.distributed.new_group(ranks=[torch.distributed.get_rank()])
+            # Degenerate 1-rank CP group. Members-only (not split_group): every
+            # rank passes a different ranks list, and use_local_synchronization
+            # keeps non-members out of new_group's eager no-color-split path,
+            # which not every cuda backend implements.
+            self.local_pgs.cp = parallel_state.create_group(
+                ranks=[torch.distributed.get_rank()],
+                use_local_synchronization=True,
+                group_desc="SINGLE_RANK_GROUP",
+            )
 
             # offset is implicit in TransformerLayer
             self.layers = torch.nn.ModuleList(

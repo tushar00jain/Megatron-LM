@@ -21,7 +21,6 @@ def create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=1):
         shape=[tp, cp, pp, dp],
         dim_names=["tp", "cp", "pp", "dp"],
         rank_offset=offset,
-        backend="nccl",
     )
     grid.create_pg(["tp"])
     grid.create_pg(["cp"])
@@ -56,10 +55,15 @@ class TestRankMappings:
 
     @classmethod
     def setup_class(cls):
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        if not dist.is_initialized():
+            # split_group needs a device-bound parent that also carries cpu:gloo,
+            # so the device and CPU subgroup filters both resolve against it.
+            dist.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                device_id=torch.device("cuda", torch.cuda.current_device()),
+            )
 
     def teardown_method(self):
         destroy_all_grids()
@@ -154,10 +158,15 @@ class TestAllGatherGroups:
 
     @classmethod
     def setup_class(cls):
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        if not dist.is_initialized():
+            # split_group needs a device-bound parent that also carries cpu:gloo,
+            # so the device and CPU subgroup filters both resolve against it.
+            dist.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                device_id=torch.device("cuda", torch.cuda.current_device()),
+            )
 
     def teardown_method(self):
         destroy_all_grids()
@@ -197,17 +206,22 @@ class TestValidateGrids:
 
     @classmethod
     def setup_class(cls):
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        if not dist.is_initialized():
+            # split_group needs a device-bound parent that also carries cpu:gloo,
+            # so the device and CPU subgroup filters both resolve against it.
+            dist.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                device_id=torch.device("cuda", torch.cuda.current_device()),
+            )
 
     def teardown_method(self):
         destroy_all_grids()
 
     def _grid_missing_tp(self, offset=0, dp=1):
         # Build a grid without a 'tp' dim to exercise the "missing 'tp'" raise.
-        grid = HyperCommGrid(shape=[dp], dim_names=["dp"], rank_offset=offset, backend="nccl")
+        grid = HyperCommGrid(shape=[dp], dim_names=["dp"], rank_offset=offset)
         grid.create_pg(["dp"])
         _active_grids.append(grid)
         return grid
@@ -255,12 +269,8 @@ class TestValidateGrids:
         # Fits inside an 8-rank world (HyperCommGrid enforces size <= world - offset).
         if dist.get_world_size() < 6:
             pytest.skip("requires at least 6 ranks")
-        src_grid = HyperCommGrid(
-            shape=[2, 1, 1, 3], dim_names=["tp", "cp", "pp", "dp"], backend="nccl"
-        )
-        dest_grid = HyperCommGrid(
-            shape=[3, 1, 1, 2], dim_names=["tp", "cp", "pp", "dp"], backend="nccl"
-        )
+        src_grid = HyperCommGrid(shape=[2, 1, 1, 3], dim_names=["tp", "cp", "pp", "dp"])
+        dest_grid = HyperCommGrid(shape=[3, 1, 1, 2], dim_names=["tp", "cp", "pp", "dp"])
         for g in (src_grid, dest_grid):
             _active_grids.append(g)
         with pytest.raises(ValueError, match="evenly divisible"):
@@ -275,10 +285,15 @@ class TestCommunicatePreconditions:
 
     @classmethod
     def setup_class(cls):
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        if not dist.is_initialized():
+            # split_group needs a device-bound parent that also carries cpu:gloo,
+            # so the device and CPU subgroup filters both resolve against it.
+            dist.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                device_id=torch.device("cuda", torch.cuda.current_device()),
+            )
 
     def teardown_method(self):
         destroy_all_grids()
@@ -313,10 +328,15 @@ class TestDestroy:
 
     @classmethod
     def setup_class(cls):
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        if not dist.is_initialized():
+            # split_group needs a device-bound parent that also carries cpu:gloo,
+            # so the device and CPU subgroup filters both resolve against it.
+            dist.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                device_id=torch.device("cuda", torch.cuda.current_device()),
+            )
 
     def teardown_method(self):
         destroy_all_grids()
@@ -394,10 +414,15 @@ class TestBridgeGradients:
 
     @classmethod
     def setup_class(cls):
-        if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
         if torch.cuda.is_available():
             torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+        if not dist.is_initialized():
+            # split_group needs a device-bound parent that also carries cpu:gloo,
+            # so the device and CPU subgroup filters both resolve against it.
+            dist.init_process_group(
+                backend="cpu:gloo,cuda:nccl",
+                device_id=torch.device("cuda", torch.cuda.current_device()),
+            )
 
     def teardown_method(self):
         destroy_all_grids()
