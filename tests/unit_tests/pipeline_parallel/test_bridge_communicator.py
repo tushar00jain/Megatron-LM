@@ -355,6 +355,24 @@ class TestBridgeCommunicatorSplitMetadata:
         with pytest.raises(ValueError, match="one payload tensor per peer"):
             bridge._run_batched_payload_p2p([torch.empty(1)], [4, 5], op="send")
 
+    def test_bridge_pg_uses_pipeline_backend(self, monkeypatch):
+        group = object()
+
+        def new_group(ranks, backend):
+            assert ranks == [1, 3]
+            assert backend == "nccl-lazy"
+            return group
+
+        BridgeCommunicator._bridge_pg_cache.clear()
+        monkeypatch.setattr(
+            parallel_state, "_pipeline_model_parallel_backend", lambda backend: "nccl-lazy"
+        )
+        monkeypatch.setattr(dist, "new_group", new_group)
+
+        assert BridgeCommunicator._get_or_create_bridge_pg([3, 1]) is group
+
+        BridgeCommunicator._bridge_pg_cache.clear()
+
 
 class TestBridgeCommunicator:
 

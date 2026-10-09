@@ -177,6 +177,34 @@ class TestHyperCommGrid:
         assert kwargs["backend"] == "nccl"
         assert kwargs["pg_options"] == mock_options
 
+    @patch('megatron.core.parallel_state._lazy_group_options')
+    @patch('torch.distributed.new_subgroups_by_enumeration')
+    def test_create_pg_lazy_options(self, mock_new_subgroups, mock_lazy_options):
+        """Test groups use the central process-group options."""
+        mock_pg = MagicMock(spec=dist.ProcessGroup)
+        mock_options = MagicMock()
+        mock_new_subgroups.return_value = (mock_pg, None)
+        mock_lazy_options.return_value = mock_options
+
+        grid = HyperCommGrid([2, 2], ["tp", "dp"])
+        result = grid.create_pg("tp")
+
+        assert result == mock_pg
+        mock_lazy_options.assert_called_once_with(None, None)
+        assert mock_new_subgroups.call_args.kwargs["pg_options"] == mock_options
+
+    @patch('torch.distributed.new_subgroups_by_enumeration')
+    def test_create_pg_backend_override(self, mock_new_subgroups):
+        """Test a group can override the grid's default backend."""
+        mock_pg = MagicMock(spec=dist.ProcessGroup)
+        mock_new_subgroups.return_value = (mock_pg, None)
+
+        grid = HyperCommGrid([2, 4], ["tp", "dp"], backend="nccl")
+        result = grid.create_pg("tp", backend="nccl-lazy")
+
+        assert result == mock_pg
+        assert mock_new_subgroups.call_args.kwargs["backend"] == "nccl-lazy"
+
     @patch('torch.distributed.new_subgroups_by_enumeration')
     def test_create_pg_duplicate_error(self, mock_new_subgroups):
         """Test create_pg raises error when trying to recreate existing process group."""

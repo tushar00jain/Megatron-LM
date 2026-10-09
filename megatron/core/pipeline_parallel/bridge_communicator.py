@@ -9,6 +9,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
 
 logger = logging.getLogger()
@@ -248,7 +249,8 @@ class BridgeCommunicator:
         ranks = sorted(ranks)
         cache_key = str(ranks)
         if cache_key not in cls._bridge_pg_cache:
-            cls._bridge_pg_cache[cache_key] = dist.new_group(ranks, backend='nccl')
+            backend = parallel_state._pipeline_model_parallel_backend('nccl')
+            cls._bridge_pg_cache[cache_key] = dist.new_group(ranks, backend=backend)
         return cls._bridge_pg_cache[cache_key]
 
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:

@@ -17,7 +17,7 @@ from megatron.core.fusions.fused_bias_dropout import bias_dropout_add_fused_trai
 from megatron.core.fusions.fused_bias_geglu import bias_geglu
 from megatron.core.fusions.fused_bias_gelu import bias_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu
-from megatron.core.parallel_state import create_group
+from megatron.core.parallel_state import create_group, get_default_process_group_options
 from megatron.core.rerun_state_machine import (
     RerunDiagnostic,
     RerunErrorInjector,
@@ -378,6 +378,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
             store = FakeStore()
             init_process_group_kwargs['backend'] = 'fake'
             init_process_group_kwargs['store'] = store
+        else:
+            default_pg_options = get_default_process_group_options(args.distributed_backend)
+            if default_pg_options is not None:
+                init_process_group_kwargs['pg_options'] = default_pg_options
 
         torch.distributed.init_process_group(**init_process_group_kwargs)
         inprocess_restart.maybe_force_nccl_backend_init(device_id)

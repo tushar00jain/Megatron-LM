@@ -12,6 +12,67 @@ world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
 
 
+@pytest.mark.parametrize(
+    ('requested_backend', 'resolved_backend', 'expected'),
+    [
+        (None, 'nccl2', 'nccl-lazy'),
+        ('nccl', 'nccl2', 'nccl-lazy'),
+        (None, 'nccl', None),
+        ('nccl', 'nccl', 'nccl'),
+    ],
+)
+def test_pipeline_model_parallel_backend_selection(
+    monkeypatch, requested_backend, resolved_backend, expected
+):
+    class BackendImpl:
+        def name(self):
+            return resolved_backend
+
+    class DefaultGroup:
+        def _get_backend(self, device):
+            assert device.type == 'cuda'
+            return BackendImpl()
+
+    monkeypatch.setattr(
+        torch.distributed.distributed_c10d, '_get_default_group', lambda: DefaultGroup()
+    )
+
+    assert ps._pipeline_model_parallel_backend(requested_backend) == expected
+
+    options = ps._lazy_group_options(requested_backend, None)
+    if resolved_backend == 'nccl2':
+        assert options.lazy_init
+    else:
+        assert options is None
+
+
+@pytest.mark.parametrize(
+    ('backend', 'nccl2_available', 'use_nccl2', 'expected_lazy'),
+    [
+        ('nccl', True, None, True),
+        ('nccl', True, '0', False),
+        ('nccl', False, None, False),
+        ('nccl2', False, None, True),
+        ('gloo', True, None, False),
+    ],
+)
+def test_default_process_group_options(
+    monkeypatch, backend, nccl2_available, use_nccl2, expected_lazy
+):
+    if nccl2_available:
+        monkeypatch.setattr(torch.distributed, 'ProcessGroupNCCL2', object(), raising=False)
+    else:
+        monkeypatch.delattr(torch.distributed, 'ProcessGroupNCCL2', raising=False)
+
+    if use_nccl2 is None:
+        monkeypatch.delenv('TORCH_DIST_USE_NCCL2', raising=False)
+    else:
+        monkeypatch.setenv('TORCH_DIST_USE_NCCL2', use_nccl2)
+
+    options = ps.get_default_process_group_options(backend)
+    assert (options is not None and options.lazy_init) is expected_lazy
+
+
 def test_inject_gtp_remat_axis():
     # Decoder/dense axis: GTP_remat is injected after 'cp', so CP keeps the more-local
     # (smaller-stride) placement and GTP_remat sits one step further out.

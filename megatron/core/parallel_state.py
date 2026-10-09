@@ -163,6 +163,53 @@ _GLOBAL_MEMORY_BUFFER = None
 # None represents the default process group
 _global_process_group_list = None
 
+_PP_DEVICE_BACKEND = "nccl-lazy"
+
+
+def get_default_process_group_options(backend: Optional[str]):
+    backend_name = str(backend).rsplit(":", 1)[-1]
+    nccl2_selected = backend_name in {"nccl2", _PP_DEVICE_BACKEND} or (
+        backend_name == "nccl"
+        and hasattr(torch.distributed, "ProcessGroupNCCL2")
+        and os.environ.get("TORCH_DIST_USE_NCCL2") != "0"
+    )
+    if not nccl2_selected:
+        return None
+    options = torch.distributed.ProcessGroupNCCL.Options()
+    options.lazy_init = True
+    return options
+
+
+def _resolved_device_backend(backend: Optional[str]) -> str:
+    backend_str = str(backend)
+    if backend is None or backend_str.rsplit(":", 1)[-1] == "nccl":
+        default_pg = torch.distributed.distributed_c10d._get_default_group()
+        try:
+            return default_pg._get_backend(torch.device("cuda")).name()
+        except RuntimeError:
+            return str(torch.distributed.get_backend(default_pg))
+    return backend_str
+
+
+def _pipeline_model_parallel_backend(backend: Optional[str]) -> Optional[str]:
+    """Use NCCL2's per-peer communicators for pipeline-parallel P2P."""
+    if backend not in (None, "nccl"):
+        return backend
+
+    resolved_backend = _resolved_device_backend(backend)
+    if resolved_backend in {"nccl2", _PP_DEVICE_BACKEND}:
+        return _PP_DEVICE_BACKEND
+    return backend
+
+
+def _lazy_group_options(backend, pg_options):
+    if _resolved_device_backend(backend) != "nccl2":
+        return pg_options
+    if pg_options is None:
+        pg_options = torch.distributed.ProcessGroupNCCL.Options()
+    pg_options.lazy_init = True
+    return pg_options
+
 
 def get_nccl_options(pg_name, nccl_comm_cfgs):
     """Set the NCCL process group options.
@@ -237,6 +284,7 @@ def create_group(
     group_desc=None,
 ):
     """Creates a ProcessGroup."""
+    pg_options = _lazy_group_options(backend, pg_options)
     kwargs = {
         "ranks": ranks,
         "timeout": timeout,
@@ -1299,11 +1347,12 @@ def initialize_model_parallel(
         os.environ["UCX_NET_DEVICES"] = "all"
         os.environ["UCC_CL_BASIC_TLS"] = "^sharp,nccl"
 
+    pp_backend = _pipeline_model_parallel_backend(pipeline_model_parallel_comm_backend)
     for ranks in decoder_rank_generator.get_ranks('pp'):
         group = create_group(
             ranks,
             timeout=timeout,
-            backend=pipeline_model_parallel_comm_backend,
+            backend=pp_backend,
             pg_options=(
                 None
                 if pipeline_model_parallel_comm_backend == "ucc"

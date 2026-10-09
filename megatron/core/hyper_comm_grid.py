@@ -221,6 +221,7 @@ class HyperCommGrid:
         is copied from new_subgroups_by_enumeration().
 
         Keyword args from `dist.new_subgroups_by_enumeration`:
+            backend (str, optional): Backend for this group. Defaults to the grid backend.
             timeout (timedelta, optional): see `init_process_group` for details and default value.
             pg_options (ProcessGroupOptions, optional): process group options
                 specifying what additional options need to be passed in during
@@ -256,7 +257,11 @@ class HyperCommGrid:
             )
 
         rank_enum = self._gen_rank_enum_for(enum_view.shape, enum_view.dim_names, enum_dims)
-        pg, _ = dist.new_subgroups_by_enumeration(rank_enum, backend=self.backend, **kwargs)
+        backend = kwargs.pop('backend', self.backend)
+        from megatron.core.parallel_state import _lazy_group_options
+
+        kwargs['pg_options'] = _lazy_group_options(backend, kwargs.get('pg_options'))
+        pg, _ = dist.new_subgroups_by_enumeration(rank_enum, backend=backend, **kwargs)
 
         if dist.is_initialized() and dist.get_rank() == 0:
             if self._is_base_pg_key(unique_group_key):

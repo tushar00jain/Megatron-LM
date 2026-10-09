@@ -93,7 +93,7 @@ def build_inference_pg_collection(
 
     tp_group = decoder_grid.create_pg("tp")
     cp_group = decoder_grid.create_pg("cp")
-    pp_group = decoder_grid.create_pg("pp")
+    pp_group = decoder_grid.create_pg("pp", backend=mpu._pipeline_model_parallel_backend(None))
     dp_group = decoder_grid.create_pg("dp")
     mp_group = decoder_grid.create_pg(["tp", "pp"])
     tp_cp_group = decoder_grid.create_pg(["tp", "cp"])
@@ -134,11 +134,11 @@ def build_inference_pg_collection(
             embd_ranks = [pp_ranks[0]]
         else:
             embd_ranks = [pp_ranks[0], pp_ranks[-1]]
-        group = dist.new_group(ranks=embd_ranks)
+        group = mpu.create_group(ranks=embd_ranks)
         if rank in embd_ranks:
             embd_group = group
         pos_embd_ranks = [pp_ranks[0]]
-        group = dist.new_group(ranks=pos_embd_ranks)
+        group = mpu.create_group(ranks=pos_embd_ranks)
         if rank in pos_embd_ranks:
             pos_embd_group = group
 

@@ -661,7 +661,7 @@ class ProcessGroupCollection:
                     "No expert data parallel group provided in pg_collection, "
                     "creating a new one with just the current rank",
                 )
-                result['expt_dp_group'] = torch.distributed.new_group(
+                result['expt_dp_group'] = parallel_state.create_group(
                     ranks=[torch.distributed.get_rank()]
                 )
 
