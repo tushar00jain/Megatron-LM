@@ -454,11 +454,11 @@ class FullyShardedDataParallelV1(_BaseDataParallel):
                 ep_group = getattr(pg_collection, 'ep', None)
 
         if tp_group is None:
-            single_rank_group = dist.new_group(ranks=[dist.get_rank()])
+            single_rank_group = parallel_state.create_group(ranks=[dist.get_rank()])
             tp_group = single_rank_group
 
         if expt_tp_group is None:
-            single_rank_group = dist.new_group(ranks=[dist.get_rank()])
+            single_rank_group = parallel_state.create_group(ranks=[dist.get_rank()])
             expt_tp_group = single_rank_group
 
         # Extract AG groups from pg_collection for explicit passing
